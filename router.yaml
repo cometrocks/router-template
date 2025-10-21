@@ -14,6 +14,11 @@ homepage:
   enabled: false
 include_subgraph_errors:
   all: true
+headers:
+  all: 
+    request:
+      - propagate:
+          matching: .*
 
 cors:
   # WARNING: allow_any_origin: true is NOT safe for production!
