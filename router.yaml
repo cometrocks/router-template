@@ -34,12 +34,13 @@ cors:
   allow_any_origin: true
 
 limits:
-  parser_max_tokens: 15000 # This is the default value.
-  parser_max_recursion: 4096 # This is the default value.
+  max_depth: 1000
+  parser_max_tokens: 50000 # This is the default value.
+  parser_max_recursion: 8192 # This is the default value.
   max_depth: 100 # Must be 15 or larger to support standard introspection query
-  max_height: 200
-  max_aliases: 30
-  max_root_fields: 20
+  max_height: 10000
+  max_aliases: 2000
+  max_root_fields: 500
 
 telemetry:
   instrumentation:
