@@ -18,6 +18,27 @@ These validation ceilings are not recommended deployment values or measured capa
 
 Do not pass secrets in these settings. Errors are fixed diagnostic labels, never environment/configuration dumps. `DEV_MODE` must be absent or empty. The pinned runtime hardcodes `/config/router_config.yaml`; `APOLLO_ROUTER_CONFIG_PATH` alone does not choose an alternate configuration. Arbitrary nested `APOLLO_ROUTER_*__*` variable names are not a substitute for the explicit configuration in this image.
 
+## Startup diagnostics and configuration drift
+
+Startup errors identify the failing check without echoing supplied values, paths, configuration contents or native validator output. Labels are stable; each has the `COMET_ROUTER_INGRESS_` prefix:
+
+| Label suffix | Check / operator action |
+| --- | --- |
+| `ARGUMENTS_INVALID` | The image's renderer invocation must provide exactly the base and output paths. |
+| `SCOPE_INVALID` | One or more fixed Railway project/environment/service identities are missing or different. Verify deployment identity against the reviewed pins. |
+| `DEV_MODE_INVALID` | Remove the nonempty `DEV_MODE` override. |
+| `MODE_INVALID` | Use exactly `off`, `observe` or `enforce`, or leave the setting unset. |
+| `RATE_INVALID` | In enforce mode, supply a canonical integer within the documented rate range. |
+| `CONCURRENCY_INVALID` | In enforce mode, supply a canonical integer within the documented concurrency range. |
+| `BASE_UNREADABLE` | The repository-controlled base must be a readable regular file and its policy check must complete. |
+| `BASE_CONFLICT` | The base already contains `traffic_shaping`; review the baseline and renderer together before deployment. |
+| `RENDER_FAILED` | Configuration staging or atomic publication failed; check the image filesystem and destination permissions without dumping configuration. |
+| `NATIVE_VALIDATION_FAILED` | The rendered configuration failed native Router validation; reproduce using the reviewed configuration without secrets before deployment. |
+
+The identity and baseline checks apply in **every mode, including off**. If the Railway integration environment or service is recreated and its ID changes, switching to off does not bypass the identity pin. Restore the original `Dockerfile` build selection for rollback, or review and update the pins to the verified replacement integration identities. Never weaken or remove the scope checks to recover a deployment.
+
+Future changes adding `traffic_shaping` to the shared `router.yaml` also make this integration image fail closed in all modes. Coordinate such changes with the renderer; do not append a second policy. Keep this warning in the integration documentation rather than modifying the shared baseline just for this wrapper.
+
 ## Scope and residual risk
 
 Router 2.7 applies these controls to its configured GraphQL GET/POST route and returns HTTP 503 with `RATE_LIMITED` or `CONCURRENCY_LIMITED` under saturation. Malformed JSON on that route consumes admission capacity before parsing. Native timeout/body/complexity settings remain unchanged.
@@ -32,7 +53,7 @@ Unknown routes, CORS preflights, health/plugin endpoints, TCP connections and HT
 4. Enable `enforce` only after that review. Check effective rendered configuration and native validation, then verify ordinary requests and local negative-test evidence. Do not flood a live deployment to prove rejection.
 5. Only after both paths' enforcement and compatibility checks pass may the separate QA provisioning/activation workflow continue.
 
-Rollback: leave QA disabled, restore router mode `off` or the prior integration Dockerfile, and verify the resulting deployment. Do not change production, remove shared IAM auth quotas, delete a brand, or delete/disconnect/reconfigure its parent store or commerce connection.
+Rollback: leave QA disabled, restore router mode `off` while the identity and baseline checks still pass, or restore the original `Dockerfile` build selection, and verify the resulting deployment. Off cannot recover from identity drift or a baseline policy conflict; use the original image path or a reviewed correction as described above. Do not change production, remove shared IAM auth quotas, delete a brand, or delete/disconnect/reconfigure its parent store or commerce connection.
 
 ## Validation
 

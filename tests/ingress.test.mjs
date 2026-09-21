@@ -59,35 +59,37 @@ test('enforce appends the exact native policy at both allowed boundaries', (t) =
   }
 });
 
-test('every pin fails closed when missing or incorrect without mutating output', (t) => {
-  for (const key of Object.keys(pins)) {
-    for (const value of [undefined, 'wrong-pin-secret-marker']) {
-      const directory = fixture(t);
-      writeFileSync(join(directory, 'rendered.yaml'), 'existing-output');
-      const result = render(directory, { [key]: value });
-      assert.equal(result.status, 1);
-      assert.equal(result.stdout, '');
-      assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_CONFIG_INVALID\n');
-      assert.equal(readFileSync(result.output, 'utf8'), 'existing-output');
+test('every pin fails closed in every mode without echoing values or mutating output', (t) => {
+  for (const mode of [undefined, 'off', 'observe', 'enforce']) {
+    for (const key of Object.keys(pins)) {
+      for (const value of [undefined, 'wrong-pin-secret-marker']) {
+        const directory = fixture(t);
+        writeFileSync(join(directory, 'rendered.yaml'), 'existing-output');
+        const result = render(directory, { [key]: value, COMET_ROUTER_INGRESS_MODE: mode });
+        assert.equal(result.status, 1);
+        assert.equal(result.stdout, '');
+        assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_SCOPE_INVALID\n');
+        assert.equal(readFileSync(result.output, 'utf8'), 'existing-output');
+      }
     }
   }
 });
 
 test('invalid mode and noncanonical capacities fail with a secret-free error', (t) => {
   const valid = { COMET_ROUTER_INGRESS_MODE: 'enforce', COMET_ROUTER_INGRESS_RATE_PER_SECOND: '10', COMET_ROUTER_INGRESS_MAX_IN_FLIGHT: '10' };
-  const cases = ['', 'ENFORCE', 'secret-marker\ntraffic_shaping:'].map((mode) => ({ ...valid, COMET_ROUTER_INGRESS_MODE: mode }));
-  for (const name of ['COMET_ROUTER_INGRESS_RATE_PER_SECOND', 'COMET_ROUTER_INGRESS_MAX_IN_FLIGHT']) {
+  const cases = ['', 'ENFORCE', 'secret-marker\ntraffic_shaping:'].map((mode) => ({ env: { ...valid, COMET_ROUTER_INGRESS_MODE: mode }, label: 'MODE_INVALID' }));
+  for (const [name, label] of [['COMET_ROUTER_INGRESS_RATE_PER_SECOND', 'RATE_INVALID'], ['COMET_ROUTER_INGRESS_MAX_IN_FLIGHT', 'CONCURRENCY_INVALID']]) {
     for (const value of [undefined, '', '0', '-1', '01', '+1', '1.0', '1e2', ' 1', '1 ', '10001', '99999999999999999999999999', '1\nsecret-marker: yes']) {
-      cases.push({ ...valid, [name]: value });
+      cases.push({ env: { ...valid, [name]: value }, label });
     }
   }
-  for (const env of cases) {
+  for (const { env, label } of cases) {
     const directory = fixture(t);
     writeFileSync(join(directory, 'rendered.yaml'), 'existing-output');
     const result = render(directory, env);
     assert.equal(result.status, 1, JSON.stringify(env));
     assert.equal(result.stdout, '');
-    assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_CONFIG_INVALID\n');
+    assert.equal(result.stderr, `COMET_ROUTER_INGRESS_${label}\n`);
     assert.equal(readFileSync(result.output, 'utf8'), 'existing-output');
   }
 });
@@ -96,7 +98,8 @@ test('DEV_MODE cannot bypass the rendered configuration', (t) => {
   for (const value of ['true', 'false', '0', 'secret-marker']) {
     const result = render(fixture(t), { DEV_MODE: value });
     assert.equal(result.status, 1);
-    assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_CONFIG_INVALID\n');
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_DEV_MODE_INVALID\n');
   }
 });
 
@@ -104,9 +107,10 @@ test('an existing traffic_shaping key is rejected for every mode', (t) => {
   for (const mode of ['off', 'observe', 'enforce']) {
     const directory = fixture(t);
     writeFileSync(join(directory, 'rendered.yaml'), 'existing-output');
-    const result = render(directory, { COMET_ROUTER_INGRESS_MODE: mode, COMET_ROUTER_INGRESS_RATE_PER_SECOND: '10', COMET_ROUTER_INGRESS_MAX_IN_FLIGHT: '10' }, `${baseline}\ntraffic_shaping: {}\n`);
+    const result = render(directory, { COMET_ROUTER_INGRESS_MODE: mode, COMET_ROUTER_INGRESS_RATE_PER_SECOND: '10', COMET_ROUTER_INGRESS_MAX_IN_FLIGHT: '10' }, `${baseline}\ntraffic_shaping: {}\n# secret-marker\n`);
     assert.equal(result.status, 1);
-    assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_CONFIG_INVALID\n');
+    assert.equal(result.stdout, '');
+    assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_BASE_CONFLICT\n');
     assert.equal(readFileSync(result.output, 'utf8'), 'existing-output');
   }
 });
@@ -115,13 +119,29 @@ test('missing input and wrong argument counts preserve the existing output', (t)
   const directory = fixture(t);
   const output = join(directory, 'rendered.yaml');
   writeFileSync(output, 'existing-output');
-  for (const args of [[], [join(root, 'router.yaml')], [join(root, 'router.yaml'), output, 'extra'], [join(directory, 'missing-input'), output]]) {
+  const cases = [
+    { args: [], label: 'ARGUMENTS_INVALID' },
+    { args: [join(root, 'router.yaml')], label: 'ARGUMENTS_INVALID' },
+    { args: [join(root, 'router.yaml'), output, 'extra-secret-marker'], label: 'ARGUMENTS_INVALID' },
+    { args: [join(directory, 'missing-secret-marker'), output], label: 'BASE_UNREADABLE' },
+    { args: [directory, output], label: 'BASE_UNREADABLE' },
+  ];
+  for (const { args, label } of cases) {
     const result = spawnSync('/bin/sh', [join(root, 'integration/render-config.sh'), ...args], { env: { ...cleanEnv, ...pins }, encoding: 'utf8' });
     assert.equal(result.status, 1);
     assert.equal(result.stdout, '');
-    assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_CONFIG_INVALID\n');
+    assert.equal(result.stderr, `COMET_ROUTER_INGRESS_${label}\n`);
     assert.equal(readFileSync(output, 'utf8'), 'existing-output');
   }
+});
+
+test('render I/O failure emits only its fixed diagnostic, not the supplied path', (t) => {
+  const directory = fixture(t);
+  const output = join(directory, 'missing-secret-marker', 'rendered.yaml');
+  const result = spawnSync('/bin/sh', [join(root, 'integration/render-config.sh'), join(root, 'router.yaml'), output], { env: { ...cleanEnv, ...pins }, encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_RENDER_FAILED\n');
 });
 
 test('integration uses the default runtime image and leaves default tracked files unchanged', () => {
@@ -157,7 +177,32 @@ test('pinned image wrapper renders, validates and forwards arguments to init', {
   const result = spawnSync('docker', [...args, '--mount', `type=bind,source=${invalid},target=/config/router_base.yaml,readonly`, dockerImage], { encoding: 'utf8', timeout: 15000 });
   assert.equal(result.status, 1);
   assert.equal(result.stdout, '');
-  assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_CONFIG_INVALID\n');
+  assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_NATIVE_VALIDATION_FAILED\n');
+});
+
+test('local wrapper harness sanitizes native validation errors and does not start init', { skip: !binary }, (t) => {
+  const directory = fixture(t);
+  const input = join(directory, 'base.yaml');
+  const output = join(directory, 'rendered.yaml');
+  const init = join(directory, 'init');
+  const entrypoint = join(directory, 'entrypoint.sh');
+  writeFileSync(input, 'secret-marker: [invalid-yaml\n');
+  writeFileSync(init, '#!/bin/sh\nprintf "INIT_REACHED\\n"\n', { mode: 0o755 });
+  // Relocate only the image's fixed paths for this local harness. This exercises
+  // the real renderer and native validator, but is not a full supervisor test.
+  let wrapper = readFileSync(join(root, 'integration/entrypoint.sh'), 'utf8');
+  for (const [original, replacement] of [
+    ['/opt/comet/render-config.sh', join(root, 'integration/render-config.sh')],
+    ['/config/router_base.yaml', input],
+    ['/config/router_config.yaml', output],
+    ['/opt/router', binary],
+    ['/init', init],
+  ]) wrapper = wrapper.replaceAll(original, `'${replacement.replaceAll("'", "'\\''")}'`);
+  writeFileSync(entrypoint, wrapper);
+  const result = spawnSync('/bin/sh', [entrypoint], { env: { ...cleanEnv, ...pins }, encoding: 'utf8' });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, '');
+  assert.equal(result.stderr, 'COMET_ROUTER_INGRESS_NATIVE_VALIDATION_FAILED\n');
 });
 
 async function listen(server) {
