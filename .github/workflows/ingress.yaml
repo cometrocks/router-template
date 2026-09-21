@@ -1,0 +1,56 @@
+name: Integration Router ingress
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - Dockerfile.integration
+      - router.yaml
+      - integration/**
+      - tests/ingress.test.mjs
+      - .github/workflows/ingress.yaml
+      - .github/workflows/supergraph.graphql
+  push:
+    paths:
+      - Dockerfile
+      - Dockerfile.integration
+      - router.yaml
+      - integration/**
+      - tests/ingress.test.mjs
+      - .github/workflows/ingress.yaml
+      - .github/workflows/supergraph.graphql
+
+permissions:
+  contents: read
+
+jobs:
+  ingress:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5.0.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Download and verify Router 2.7.0
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/router-test"
+          gh release download v2.7.0 --repo apollographql/router \
+            --pattern router-v2.7.0-x86_64-unknown-linux-gnu.tar.gz \
+            --dir "$RUNNER_TEMP/router-test"
+          cd "$RUNNER_TEMP/router-test"
+          printf '%s\n' '1b7d5c17488660e3d4b621d57bb330260ab9ea64a326fce6267dd44af137ae1a  router-v2.7.0-x86_64-unknown-linux-gnu.tar.gz' | sha256sum --check --strict
+          tar -xzf router-v2.7.0-x86_64-unknown-linux-gnu.tar.gz
+          file dist/router | grep 'ELF 64-bit.*x86-64'
+          test "$(dist/router --version)" = '2.7.0'
+      - name: Build the integration runtime
+        run: docker build --file Dockerfile.integration --tag comet-router-ingress-test .
+      - name: Test renderer, runtime wrapper and local synthetic HTTP
+        env:
+          REQUIRE_ROUTER_INTEGRATION: '1'
+          ROUTER_TEST_IMAGE: comet-router-ingress-test
+          ROUTER_TEST_BINARY: ${{ runner.temp }}/router-test/dist/router
+        run: node --test tests/ingress.test.mjs

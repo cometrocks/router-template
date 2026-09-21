@@ -1,0 +1,12 @@
+# Explicitly select this file for the integration service only.
+# Keep the default Dockerfile and router.yaml unchanged.
+# renovate: datasource=docker depName=ghcr.io/apollographql/apollo-runtime extractVersion=^[^_]+
+FROM ghcr.io/apollographql/apollo-runtime:0.0.27_router2.7.0_mcp-server1.0.0
+
+COPY router.yaml /config/router_base.yaml
+COPY integration/render-config.sh /opt/comet/render-config.sh
+COPY integration/entrypoint.sh /opt/comet/entrypoint.sh
+
+# Invoke through sh; no dependency on source-file executable permissions.
+# The wrapper hands PID 1 to the original runtime supervisor after validation.
+ENTRYPOINT ["/bin/sh", "/opt/comet/entrypoint.sh"]
