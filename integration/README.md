@@ -14,7 +14,29 @@ The default `Dockerfile` and `router.yaml` are unchanged. Select `Dockerfile.int
 
 These validation ceilings are not recommended deployment values or measured capacity. There are no default enforcement budgets. Each router process owns its limits; adding replicas multiplies aggregate capacity. The native interval budget is not a smooth global request distribution.
 
-`off` and `observe` preserve the baseline YAML exactly and add no native limits. Router observe mode adds no new telemetry: use existing payload-free aggregate provider metrics and controlled local measurements. It must not be described as enforcement. Available CPU/memory samples and sparse edge requests do not justify capacities, and bucketed counts/duration percentiles do not establish instantaneous concurrency.
+`off` and `observe` add no native limits. Both preserve the baseline YAML exactly with the observation option disabled. Sparse edge requests and latency percentiles do not establish instantaneous concurrency.
+
+### Active-request observation
+
+Set `COMET_ROUTER_OBSERVE_METRICS=1` only on the pinned integration router in
+`observe` mode. The default is `0`. The option adds a Prometheus listener at
+`127.0.0.1:19091/metrics` inside the router container. Keep this port off
+ingress. Collect through an integration service shell pinned to a deployment
+instance using `railway ssh --deployment-instance`. Run this inside the
+container so the exporter response and labels stay there:
+
+```sh
+scrape=$(curl --fail --silent --max-time 2 http://127.0.0.1:19091/metrics) &&
+  printf '%s\n' "$scrape" | awk -f /opt/comet/observation-metrics.awk
+```
+
+The filter emits the active count and, once available, the duration count and
+sum. Treat an empty or failed read as a missing sample. Record deployment and
+instance IDs, sample interval, gaps, and maximum sampled active requests for
+each instance. Use the largest per-instance maximum in the budget review. Short
+overlaps can fall between samples. Interpret that maximum alongside the request
+rate, latency, controlled overlap test, and an explicit workload margin.
+Remove the option before switching to `enforce`.
 
 Do not pass secrets in these settings. Errors are fixed diagnostic labels, never environment/configuration dumps. `DEV_MODE` must be absent or empty. The pinned runtime hardcodes `/config/router_config.yaml`; `APOLLO_ROUTER_CONFIG_PATH` alone does not choose an alternate configuration. Arbitrary nested `APOLLO_ROUTER_*__*` variable names are not a substitute for the explicit configuration in this image.
 
@@ -28,6 +50,8 @@ Startup errors identify the failing check without echoing supplied values, paths
 | `SCOPE_INVALID` | One or more fixed Railway project/environment/service identities are missing or different. Verify deployment identity against the reviewed pins. |
 | `DEV_MODE_INVALID` | Remove the nonempty `DEV_MODE` override. |
 | `MODE_INVALID` | Use exactly `off`, `observe` or `enforce`, or leave the setting unset. |
+| `METRICS_MODE_INVALID` | Use `0` or omit the option. Use `1` only in `observe` mode. |
+| `METRICS_BASE_CONFLICT` | Review the baseline telemetry layout before enabling observation. |
 | `RATE_INVALID` | In enforce mode, supply a canonical integer within the documented rate range. |
 | `CONCURRENCY_INVALID` | In enforce mode, supply a canonical integer within the documented concurrency range. |
 | `BASE_UNREADABLE` | The repository-controlled base must be a readable regular file and its policy check must complete. |

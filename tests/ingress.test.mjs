@@ -21,6 +21,14 @@ const binary = process.env.ROUTER_TEST_BINARY;
 const dockerImage = process.env.ROUTER_TEST_IMAGE;
 const delay = (ms) => new Promise((done) => setTimeout(done, ms));
 
+function filterObservation(scrape) {
+  return spawnSync('awk', ['-f', join(root, 'integration/observation-metrics.awk')], {
+    input: scrape,
+    env: cleanEnv,
+    encoding: 'utf8',
+  });
+}
+
 function fixture(t) {
   const directory = mkdtempSync(join(tmpdir(), 'comet-ingress-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
@@ -44,6 +52,60 @@ test('off, observe and unset modes preserve baseline bytes and restrictive permi
     assert.equal(readFileSync(result.output, 'utf8'), baseline);
     assert.equal(statSync(result.output).mode & 0o777, 0o600);
     assert.equal(result.stdout, '');
+  }
+});
+
+test('metrics require an explicit observe opt-in and use a fixed loopback endpoint', (t) => {
+  const enabled = render(fixture(t), {
+    COMET_ROUTER_INGRESS_MODE: 'observe',
+    COMET_ROUTER_OBSERVE_METRICS: '1',
+  });
+  assert.equal(enabled.status, 0, enabled.stderr);
+  const config = readFileSync(enabled.output, 'utf8');
+  assert.match(config, /^        listen: 127\.0\.0\.1:19091$/m);
+  assert.match(config, /^        resource_selector: none$/m);
+  assert.match(config, /name: "\*"\n +aggregation: drop/);
+  for (const mode of ['off', 'enforce']) {
+    const denied = render(fixture(t), {
+      COMET_ROUTER_INGRESS_MODE: mode,
+      COMET_ROUTER_OBSERVE_METRICS: '1',
+    });
+    assert.equal(denied.stderr, 'COMET_ROUTER_INGRESS_METRICS_MODE_INVALID\n');
+  }
+  const invalid = render(fixture(t), {
+    COMET_ROUTER_INGRESS_MODE: 'observe',
+    COMET_ROUTER_OBSERVE_METRICS: 'secret-marker',
+  });
+  assert.equal(invalid.stderr, 'COMET_ROUTER_INGRESS_METRICS_MODE_INVALID\n');
+  for (const key of ['exporters', 'exporters ', "'exporters'", '"exporters"']) {
+    const conflict = render(fixture(t), {
+      COMET_ROUTER_INGRESS_MODE: 'observe',
+      COMET_ROUTER_OBSERVE_METRICS: '1',
+    }, `${baseline}\n  ${key}: {}\n`);
+    assert.equal(conflict.stderr, 'COMET_ROUTER_INGRESS_METRICS_BASE_CONFLICT\n');
+  }
+});
+
+test('in-container observation filter drops metadata and rejects incomplete or duplicate samples', () => {
+  const scope = '{otel_scope_name="apollo/router"}';
+  const active = `http_server_active_requests${scope} 4`;
+  const count = `http_server_request_duration_seconds_count${scope} 15`;
+  const sum = `http_server_request_duration_seconds_sum${scope} 1.2e-3`;
+  const input = [
+    'target_info{unexpected="private-fixture"} 1',
+    'http_server_active_requests{user="private-fixture"} 999',
+    'request_secret 999',
+    active,
+    count,
+    sum,
+  ].join('\n');
+  const filtered = filterObservation(input);
+  assert.equal(filtered.status, 0, filtered.stderr);
+  assert.equal(filtered.stdout, 'active_requests 4\nrequest_duration_count 15\nrequest_duration_sum 1.2e-3\n');
+  for (const invalid of [count, [active, active].join('\n'), [active, count].join('\n')]) {
+    const rejected = filterObservation(invalid);
+    assert.equal(rejected.status, 1);
+    assert.equal(rejected.stdout, '');
   }
 });
 
@@ -162,7 +224,16 @@ test('CI requires an explicit Router binary', () => {
 test('pinned image wrapper renders, validates and forwards arguments to init', { skip: !dockerImage, timeout: 60000 }, (t) => {
   const directory = fixture(t);
   const init = join(directory, 'init');
-  writeFileSync(init, '#!/bin/sh\nprintf "INIT_REACHED:%s\\n" "$*"\ncat /config/router_config.yaml\n', { mode: 0o755 });
+  writeFileSync(init, [
+    '#!/bin/sh',
+    'set -e',
+    'command -v curl >/dev/null',
+    'command -v awk >/dev/null',
+    'test -r /opt/comet/observation-metrics.awk',
+    'printf "INIT_REACHED:%s\\n" "$*"',
+    'cat /config/router_config.yaml',
+    '',
+  ].join('\n'), { mode: 0o755 });
   const args = ['run', '--rm', '--network', 'none', '--mount', `type=bind,source=${init},target=/init,readonly`];
   for (const [key, value] of Object.entries(pins)) args.push('--env', `${key}=${value}`);
   args.push('--env', 'APOLLO_TELEMETRY_DISABLED=true');
@@ -172,6 +243,12 @@ test('pinned image wrapper renders, validates and forwards arguments to init', {
     const rendered = render(fixture(t), { COMET_ROUTER_INGRESS_MODE: mode, COMET_ROUTER_INGRESS_RATE_PER_SECOND: '1', COMET_ROUTER_INGRESS_MAX_IN_FLIGHT: '1' });
     assert.equal(result.stdout, `INIT_REACHED:forwarded-argument\n${readFileSync(rendered.output, 'utf8')}`);
   }
+  const observed = spawnSync('docker', [
+    ...args, '--env', 'COMET_ROUTER_INGRESS_MODE=observe', '--env', 'COMET_ROUTER_OBSERVE_METRICS=1',
+    dockerImage, 'forwarded-argument',
+  ], { encoding: 'utf8', timeout: 15000 });
+  assert.equal(observed.status, 0, observed.stderr);
+  assert.match(observed.stdout, /^        listen: 127\.0\.0\.1:19091$/m);
   const invalid = join(directory, 'invalid.yaml');
   writeFileSync(invalid, 'secret-marker: [invalid-yaml\n');
   const result = spawnSync('docker', [...args, '--mount', `type=bind,source=${invalid},target=/config/router_base.yaml,readonly`, dockerImage], { encoding: 'utf8', timeout: 15000 });
@@ -213,17 +290,18 @@ async function listen(server) {
 async function startRouter(t, limits) {
   const directory = fixture(t);
   let subgraphCalls = 0;
-  let pending;
+  const pending = [];
   let hold = false;
   const stub = createServer(async (request, response) => {
     for await (const _ of request) { /* consume only the synthetic local request */ }
     subgraphCalls += 1;
-    if (hold) await new Promise((done) => { pending = done; });
+    if (hold) await new Promise((done) => { pending.push(done); });
     response.writeHead(200, { 'content-type': 'application/json' });
     response.end(JSON.stringify({ data: { me: { name: 'Local fixture' } } }));
   });
   const subgraphPort = await listen(stub);
-  t.after(() => { pending?.(); stub.closeAllConnections(); stub.close(); });
+  const release = () => { hold = false; pending.splice(0).forEach((done) => done()); };
+  t.after(() => { release(); stub.closeAllConnections(); stub.close(); });
   const reservation = createServer();
   const port = await listen(reservation);
   await new Promise((done) => reservation.close(done));
@@ -253,8 +331,59 @@ async function startRouter(t, limits) {
   }
   assert.ok(ready, `Router did not become ready: ${logs}`);
   const post = (body = JSON.stringify({ query: '{ me { name } }' })) => fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body, signal: AbortSignal.timeout(5000) });
-  return { url, post, calls: () => subgraphCalls, hold: () => { hold = true; }, release: () => { hold = false; pending?.(); } };
+  return { url, post, calls: () => subgraphCalls, hold: () => { hold = true; }, release };
 }
+
+test('native observe metrics show overlap and recovery on the separate listener', { skip: !binary, timeout: 15000 }, async (t) => {
+  const router = await startRouter(t, { COMET_ROUTER_INGRESS_MODE: 'observe', COMET_ROUTER_OBSERVE_METRICS: '1' });
+  assert.equal((await fetch(`${router.url}metrics`)).status, 404);
+  router.hold();
+  const query = JSON.stringify({ query: 'query PrivateFixtureMarker { me { name } }' });
+  const replies = Promise.all([router.post(query), router.post(query)]);
+  replies.catch(() => {}); // Teardown can close an in-flight request on assertion failure.
+  for (let attempt = 0; attempt < 100 && router.calls() < 2; attempt += 1) await delay(20);
+  assert.equal(router.calls(), 2);
+  const scope = 'otel_scope_name="apollo/router"';
+  const metadata = 'process_executable_name="router",service_name="unknown_service:router",service_version="2.7.0"';
+  const series = new Map([
+    ['http_server_active_requests', scope],
+    ['target_info', metadata],
+  ]);
+  for (const duration of ['http_server_request_duration', 'http_server_request_duration_seconds']) {
+    series.set(`${duration}_sum`, scope);
+    series.set(`${duration}_count`, scope);
+  }
+  const scrape = async () => {
+    const response = await fetch('http://127.0.0.1:19091/metrics', { signal: AbortSignal.timeout(2000) });
+    assert.equal(response.status, 200);
+    const body = await response.text();
+    assert.doesNotMatch(body, /PrivateFixtureMarker/);
+    const samples = body.split('\n').filter((line) => line && !line.startsWith('#'));
+    for (const sample of samples) {
+      const parts = sample.match(/^(\w+)\{([^{}]+)\} [\d.eE+-]+$/);
+      assert.ok(parts, sample);
+      const [, name, labels] = parts;
+      if (/^http_server_request_duration(?:_seconds)?_bucket$/.test(name)) {
+        const bucketLabels = labels.split(',');
+        assert.equal(bucketLabels.length, 2);
+        assert.ok(bucketLabels.includes(scope));
+        assert.ok(bucketLabels.some((label) => /^le="(?:\+Inf|[\d.eE+-]+)"$/.test(label)));
+      } else {
+        assert.equal(labels, series.get(name), sample);
+      }
+    }
+    return body;
+  };
+  assert.match(await scrape(), /^http_server_active_requests\{otel_scope_name="apollo\/router"\} 2$/m);
+  router.release();
+  for (const response of await replies) assert.equal(response.status, 200);
+  const recovered = await scrape();
+  assert.match(recovered, /^http_server_active_requests\{otel_scope_name="apollo\/router"\} 0$/m);
+  assert.match(recovered, /^http_server_request_duration(?:_seconds)?_count\{otel_scope_name="apollo\/router"\} 2$/m);
+  const filtered = filterObservation(recovered);
+  assert.equal(filtered.status, 0, filtered.stderr);
+  assert.match(filtered.stdout, /^active_requests 0\nrequest_duration_count 2\nrequest_duration_sum [\d.eE+-]+\n$/);
+});
 
 test('Router 2.7.0 validates every rendered mode and capacity boundary', { skip: !binary }, (t) => {
   const version = spawnSync(binary, ['--version'], { env: cleanEnv, encoding: 'utf8' });
