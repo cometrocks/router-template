@@ -22,6 +22,13 @@ case "$mode" in
   *) fail MODE_INVALID ;;
 esac
 
+observe_metrics=${COMET_ROUTER_OBSERVE_METRICS-0}
+case "$observe_metrics" in
+  0) ;;
+  1) [ "$mode" = observe ] || fail METRICS_MODE_INVALID ;;
+  *) fail METRICS_MODE_INVALID ;;
+esac
+
 positive_capacity() {
   # Canonical integers only: avoids shell overflow, YAML injection and coercion.
   case "$1" in
@@ -51,6 +58,44 @@ fi
 temporary=$(mktemp "${output}.tmp.XXXXXX" 2>/dev/null) || fail RENDER_FAILED
 trap 'rm -f "$temporary" 2>/dev/null' EXIT HUP INT TERM
 cp "$base" "$temporary" 2>/dev/null || fail RENDER_FAILED
+if [ "$observe_metrics" = 1 ]; then
+  # Insert only into the checked-in layout. Refuse duplicate settings or a
+  # changed layout rather than silently replacing existing telemetry.
+  awk '
+    /^telemetry:$/ {
+      telemetry++
+      print
+      print "  exporters:"
+      print "    metrics:"
+      print "      common:"
+      print "        views:"
+      print "          - name: http.server.active_requests"
+      print "            allowed_attribute_keys: []"
+      print "          - name: http.server.request.duration"
+      print "            allowed_attribute_keys: []"
+      print "          - name: \"*\""
+      print "            aggregation: drop"
+      print "      prometheus:"
+      print "        enabled: true"
+      print "        listen: 127.0.0.1:19091"
+      print "        path: /metrics"
+      print "        resource_selector: none"
+      next
+    }
+    /^  instrumentation:$/ {
+      instrumentation++
+      print
+      print "    instruments:"
+      print "      router:"
+      print "        http.server.active_requests: true"
+      print "        http.server.request.duration: true"
+      next
+    }
+    /^[[:space:]]*["\047]?(exporters|instruments|prometheus)["\047]?[[:space:]]*:/ { conflict = 1 }
+    { print }
+    END { if (conflict || telemetry != 1 || instrumentation != 1) exit 1 }
+  ' "$base" > "$temporary" 2>/dev/null || fail METRICS_BASE_CONFLICT
+fi
 if [ "$mode" = enforce ]; then
   (printf '\ntraffic_shaping:\n  router:\n    global_rate_limit:\n      capacity: %s\n      interval: 1s\n    concurrency_limit: %s\n' \
     "$COMET_ROUTER_INGRESS_RATE_PER_SECOND" \
